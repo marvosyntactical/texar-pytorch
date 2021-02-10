@@ -23,11 +23,23 @@ Hyperparameters and data path may be specified in config_trans.py
 
 """
 
+import sys
+import os
+# FIXME TODO hack from ttps://stackoverflow.com/questions/6323860/sibling-package-imports/50193944#50193944
+# to get tinyquant module
+sys.path.insert(0, os.path.abspath('../../../../cnn/'))
+sys.path.insert(0, os.path.abspath('../../../normedQuantLSTM/'))
+
+from quantize_dynamic import *
+
+from collections import namedtuple
+from model_lm import *
+
+LSTMArgs = namedtuple("LSTMArgs", ["shared", "char", "data", "method"])
+
 import argparse
 import importlib
 import math
-import os
-import sys
 import time
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -52,6 +64,22 @@ parser.add_argument(
 parser.add_argument(
     '--out', type=str, default=None,
     help="Generation output path.")
+parser.add_argument(
+    '--torchquant', action="store_true", default=False,
+    help="Quantize loaded model dynamically using pytorch?")
+parser.add_argument(
+    '--tinyquant', action="store_true", default=False,
+    help="Quantize loaded model dynamically using tinyquant (NOTIMPLEMENTED)?")
+parser.add_argument(
+    '--non-quantizable', action="store_true", default=False,
+    help="Dont train quantizable, but normal Texar LSTM?")
+parser.add_argument(
+    '--quantize', action="store_true", default=False,
+    help="quantize quantizable trained lstm using given --method")
+parser.add_argument(
+    '--method', type=str, default="bwn",
+    choices=["bwn", "binary_connect","ternary_connect","twn","lat"],
+    help="quantize using given method ?")
 
 args = parser.parse_args()
 
@@ -68,26 +96,75 @@ def kl_divergence(means: Tensor, logvars: Tensor) -> Tensor:
 class VAE(nn.Module):
     _latent_z: Tensor
 
-    def __init__(self, vocab_size: int, config_model):
+    def set_optim(self, optim):
+        self.encoder._cell.set_optim(optim)
+        if hasattr(self, "lstm_decoder"):
+            self.lstm_decoder._cell.set_optim(optim)
+
+    def __init__(self, vocab_size: int, config_model, quantizable=True, quantize=True, method="bwn"):
+        if quantize:
+            assert quantizable
         super().__init__()
         # Model architecture
         self._config = config_model
         self.encoder_w_embedder = tx.modules.WordEmbedder(
             vocab_size=vocab_size, hparams=config_model.enc_emb_hparams)
 
+        # ============= ENCODER INIT ================
+
+        enc_inp_size = self.encoder_w_embedder.dim
+        num_enc_layers = config_model.enc_cell_hparams["num_layers"]
+        norm_type = "weight" # layer weight batch
+
+        quantized_lstm_cell_enc = LSTM_quantized_for_Texar(
+                input_size=enc_inp_size,
+                hidden_size=config_model.enc_cell_hparams["kwargs"]["num_units"],
+                bias=config_model.enc_cell_hparams["kwargs"]["bias"],
+                norm=norm_type,
+                args=LSTMArgs(
+                    shared=False,
+                    char=False,
+                    data=[],
+                    method=method
+                ),
+                num_layers=num_enc_layers,
+                quantize=quantize
+        )
+
         self.encoder = tx.modules.UnidirectionalRNNEncoder[tx.core.LSTMState](
-            input_size=self.encoder_w_embedder.dim,
-            hparams={
-                "rnn_cell": config_model.enc_cell_hparams,
-            })
+            input_size=enc_inp_size,
+            cell=quantized_lstm_cell_enc if quantizable else None,
+            hparams={"rnn_cell": config_model.enc_cell_hparams}
+        )
 
         self.decoder_w_embedder = tx.modules.WordEmbedder(
             vocab_size=vocab_size, hparams=config_model.dec_emb_hparams)
 
+
         if config_model.decoder_type == "lstm":
+
+            # ============= DECODER INIT ================
+
+            dec_inp_size = (self.decoder_w_embedder.dim + config_model.latent_dims)
+
+            quantized_lstm_cell_dec = LSTM_quantized_for_Texar(
+                    input_size=dec_inp_size,
+                    hidden_size=config_model.dec_cell_hparams["kwargs"]["num_units"],
+                    bias=config_model.dec_cell_hparams["kwargs"]["bias"],
+                    norm=norm_type,
+                    args=LSTMArgs(
+                        shared=False,
+                        char=False,
+                        data=[],
+                        method=method
+                    ),
+                    num_layers=config_model.dec_cell_hparams["num_layers"],
+                    quantize=quantize
+            )
+
             self.lstm_decoder = tx.modules.BasicRNNDecoder(
-                input_size=(self.decoder_w_embedder.dim +
-                            config_model.latent_dims),
+                input_size=dec_inp_size,
+                cell=quantized_lstm_cell_dec if quantizable else None,
                 vocab_size=vocab_size,
                 token_embedder=self._embed_fn_rnn,
                 hparams={"rnn_cell": config_model.dec_cell_hparams})
@@ -111,7 +188,8 @@ class VAE(nn.Module):
 
         self.connector_mlp = tx.modules.MLPTransformConnector(
             config_model.latent_dims * 2,
-            linear_layer_dim=self.encoder.cell.hidden_size * 2)
+            linear_layer_dim=self.encoder.cell.hidden_size * 2*num_enc_layers,
+        )
 
         self.mlp_linear_layer = nn.Linear(
             config_model.latent_dims, sum_state_size)
@@ -127,6 +205,7 @@ class VAE(nn.Module):
             input_embed,
             sequence_length=data_batch["length"])
 
+        # print(encoder_states[-1][-1].shape, self.connector_mlp)
         mean_logvar = self.connector_mlp(encoder_states)
         mean, logvar = torch.chunk(mean_logvar, 2, 1)
         kl_loss = kl_divergence(mean, logvar)
@@ -226,7 +305,7 @@ def main() -> None:
     """Entrypoint.
     """
     config: Any = importlib.import_module(args.config)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if (torch.cuda.is_available() and not args.mode=="predict") else "cpu")
 
     train_data = tx.data.MonoTextData(config.train_data_hparams, device=device)
     val_data = tx.data.MonoTextData(config.val_data_hparams, device=device)
@@ -261,7 +340,9 @@ def main() -> None:
                       (len(train_data) / config.batch_size))
 
     vocab = train_data.vocab
-    model = VAE(train_data.vocab.size, config)
+    quantize = config.quantize.lower()=="true"
+
+    model = VAE(train_data.vocab.size, config, quantizable = not args.non_quantizable, quantize=args.quantize, method=args.method)
     model.to(device)
 
     start_tokens = torch.full(
@@ -272,6 +353,7 @@ def main() -> None:
     optimizer = tx.core.get_optimizer(
         params=model.parameters(),
         hparams=config.opt_hparams)
+    model.set_optim(optimizer) # for LSTm.quantize to access ADAM for some reason
     scheduler = ExponentialLR(optimizer, decay_factor)
 
     def _run_epoch(epoch: int, mode: str, display: int = 10) \
@@ -337,11 +419,21 @@ def main() -> None:
         return nll, ppl  # type: ignore
 
     @torch.no_grad()
-    def _generate(start_tokens: torch.LongTensor,
-                  end_token: int,
-                  filename: Optional[str] = None):
+    def _generate(
+          model: nn.Module,
+          start_tokens: torch.LongTensor,
+          end_token: int,
+          filename: Optional[str] = None,
+          device="cpu",
+        ):
+
+        # load model from ckpt and do inference
+        # also quantize if requested
+
         ckpt = torch.load(args.model)
         model.load_state_dict(ckpt['model'])
+        if args.torchquant:
+            model = quantize_dynamic_torch(model)
         model.eval()
 
         batch_size = train_data.batch_size
@@ -382,7 +474,7 @@ def main() -> None:
         fh.close()
 
     if args.mode == "predict":
-        _generate(start_tokens, end_token, args.out)
+        _generate(model, start_tokens, end_token, args.out, device)
         return
     # Counts trainable parameters
     total_parameters = sum(param.numel() for param in model.parameters())
@@ -391,7 +483,7 @@ def main() -> None:
     best_nll = best_ppl = 0.
 
     for epoch in range(config.num_epochs):
-        _, _ = _run_epoch(epoch, 'train', display=200)
+        _, _ = _run_epoch(epoch, 'train', display=50)
         val_nll, _ = _run_epoch(epoch, 'valid')
         test_nll, test_ppl = _run_epoch(epoch, 'test')
 
