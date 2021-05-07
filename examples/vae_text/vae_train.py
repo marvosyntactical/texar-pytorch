@@ -26,16 +26,12 @@ Hyperparameters and data path may be specified in config_trans.py
 import sys
 import os
 # FIXME TODO hack from ttps://stackoverflow.com/questions/6323860/sibling-package-imports/50193944#50193944
-# to get tinyquant module
-sys.path.insert(0, os.path.abspath('../../../../cnn/'))
 sys.path.insert(0, os.path.abspath('../../../normedQuantLSTM/'))
 
 from quantize_dynamic import *
 
 from collections import namedtuple
 from model_lm import *
-
-LSTMArgs = namedtuple("LSTMArgs", ["shared", "char", "data", "method"])
 
 import argparse
 import importlib
@@ -50,6 +46,12 @@ from torch.optim.lr_scheduler import ExponentialLR
 
 import texar.torch as tx
 from texar.torch.custom import MultivariateNormalDiag
+
+from torch.utils.tensorboard import SummaryWriter
+
+
+LSTMArgs = namedtuple("LSTMArgs", ["shared", "char", "data", "method"])
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -78,8 +80,8 @@ parser.add_argument(
     help="quantize quantizable trained lstm using given --method")
 parser.add_argument(
     '--method', type=str, default="bwn",
-    choices=["bwn", "binary_connect","ternary_connect","twn","lat"],
-    help="quantize using given method ?")
+    choices=["bwn", "binary_connect","ternary_connect","twn","lat", "lab"],
+    help="quantize using given method")
 
 args = parser.parse_args()
 
@@ -87,8 +89,7 @@ args = parser.parse_args()
 def kl_divergence(means: Tensor, logvars: Tensor) -> Tensor:
     """Compute the KL divergence between Gaussian distribution
     """
-    kl_cost = -0.5 * (logvars - means ** 2 -
-                      torch.exp(logvars) + 1.0)
+    kl_cost = -0.5 * (logvars - means ** 2 - torch.exp(logvars) + 1.0)
     kl_cost = torch.mean(kl_cost, 0)
     return torch.sum(kl_cost)
 
@@ -306,6 +307,7 @@ def main() -> None:
     """
     config: Any = importlib.import_module(args.config)
     device = torch.device("cuda" if (torch.cuda.is_available() and not args.mode=="predict") else "cpu")
+    print(f"Training on {device}")
 
     train_data = tx.data.MonoTextData(config.train_data_hparams, device=device)
     val_data = tx.data.MonoTextData(config.val_data_hparams, device=device)
@@ -326,14 +328,27 @@ def main() -> None:
     decay_factor = config.lr_decay_hparams["decay_factor"]
     decay_ts = config.lr_decay_hparams["threshold"]
 
+    # ckpts
     save_dir = f"./models/{config.dataset}"
 
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
+
     suffix = f"{config.dataset}_{config.decoder_type}Decoder.ckpt"
 
     save_path = os.path.join(save_dir, suffix)
+
+    # logging w/ tensorboard
+    logs = "logs"
+    logdir = os.path.join(logs, args.config.split(".")[-1])
+
+    if not os.path.exists(logs):
+        os.makedirs(logs)
+    if not os.path.exists(logdir):
+        os.makedirs(logdir)
+
+    writer = SummaryWriter(log_dir=logdir)
 
     # KL term annealing rate
     anneal_r = 1.0 / (config.kl_anneal_hparams["warm_up"] *
@@ -356,7 +371,7 @@ def main() -> None:
     model.set_optim(optimizer) # for LSTm.quantize to access ADAM for some reason
     scheduler = ExponentialLR(optimizer, decay_factor)
 
-    def _run_epoch(epoch: int, mode: str, display: int = 10) \
+    def _run_epoch(epoch: int, mode: str, display: int = 10, writer=None) \
             -> Tuple[Tensor, float]:
         iterator.switch_to_dataset(mode)
 
@@ -375,8 +390,17 @@ def main() -> None:
         nll_total = 0.
 
         avg_rec = tx.utils.AverageRecorder()
+
         for batch in iterator:
+
             ret = model(batch, kl_weight, start_tokens, end_token)
+
+            if writer is not None:
+                scalar_dict = {k: val.item() for k, val in ret.items() if k != "lengths"}
+                if mode == "train":
+                    scalar_dict.update({"kl_weight":opt_vars["kl_weight"]})
+                writer.add_scalars(mode, scalar_dict)
+
             if mode == "train":
                 opt_vars["kl_weight"] = min(
                     1.0, opt_vars["kl_weight"] + anneal_r)
@@ -393,6 +417,8 @@ def main() -> None:
                  ret["kl_loss"].item(),
                  ret["rc_loss"].item()],
                 batch_size)
+
+
             if step % display == 0 and mode == 'train':
                 nll = avg_rec.avg(0)
                 klw = opt_vars["kl_weight"]
@@ -483,9 +509,9 @@ def main() -> None:
     best_nll = best_ppl = 0.
 
     for epoch in range(config.num_epochs):
-        _, _ = _run_epoch(epoch, 'train', display=50)
-        val_nll, _ = _run_epoch(epoch, 'valid')
-        test_nll, test_ppl = _run_epoch(epoch, 'test')
+        _, _ = _run_epoch(epoch, 'train', display=50, writer=writer)
+        val_nll, _ = _run_epoch(epoch, 'valid', writer=writer)
+        test_nll, test_ppl = _run_epoch(epoch, 'test', writer=writer)
 
         if val_nll < opt_vars['best_valid_nll']:
             opt_vars['best_valid_nll'] = val_nll

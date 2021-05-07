@@ -11,21 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""VAE config.
+"""
+VAE LSTM config.
+Based on Bowman et al. https://arxiv.org/pdf/1511.06349.pdf
+Adapt for Quantized LSTM
 """
 
 dataset = "ptb"
 num_epochs = 100
-hidden_size = 256
+hidden_size = 191
 dec_dropout_in = 0.5
 dec_dropout_out = 0.5
 enc_dropout_in = 0.
 enc_dropout_out = 0.
-word_keep_prob = 0.5
+word_keep_prob = 0.62
 batch_size = 32
-embed_dim = 256
+embed_dim = 353
+num_layers = 3
 
-latent_dims = 32
+latent_dims = 13
 
 lr_decay_hparams = {
     "init_lr": 0.001,
@@ -36,25 +40,27 @@ lr_decay_hparams = {
 
 
 decoder_type = 'lstm'
+quantize = "true"
 
 enc_cell_hparams = {
     "type": "LSTMCell",
     "kwargs": {
         "num_units": hidden_size,
-        "bias": 0.
+        "bias": .1,
     },
     "dropout": {"output_keep_prob": 1. - enc_dropout_out},
-    "num_layers": 1
+    "num_layers": num_layers
 }
 
+# these default values are substituted in during quantization so dont change
 dec_cell_hparams = {
     "type": "LSTMCell",
     "kwargs": {
         "num_units": hidden_size,
-        "bias": 0.,
+        "bias": .1,
     },
     "dropout": {"output_keep_prob": 1. - dec_dropout_out},
-    "num_layers": 1,
+    "num_layers": num_layers,
 }
 
 enc_emb_hparams = {
